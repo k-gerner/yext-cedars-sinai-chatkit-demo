@@ -344,27 +344,27 @@ export default function App() {
     onLog: (e) => console.log("ChatKit log:", e.name, e.data),
     onEffect: (e) => console.log("ChatKit effect:", e.name, e.data),
     startScreen: {
-      greeting: "Welcome to Yext Hitchhikers support! How can we help today?",
+      greeting: "Welcome to Cedars-Sinai Find-a-Doc! How can we help today?",
       prompts: [
         {
-          icon: "circle-question",
-          label: "What is Yext Search?",
-          prompt: "What is Yext Search?",
+          icon: "chart",
+          label: "Stomach pain",
+          prompt: "I'm having stomach pains, help me find doctors who can help.",
         },
         {
           icon: "circle-question",
-          label: "Help me with a Search Frontend",
-          prompt: "How can I set up a new Search Frontend?",
+          label: "Cancer",
+          prompt: "Help me find a cancer specialist.",
         },
         {
           icon: "circle-question",
-          label: "What are custom phrases?",
-          prompt: "What are custom phrases in Yext Search?",
+          label: "Knee pain",
+          prompt: "I have some pain in my knee. Help me find doctors who can help.",
         },
       ],
     },
     composer: {
-      placeholder: "Type your message...",
+      placeholder: "Describe what you're looking for...",
     },
   });
 
@@ -406,7 +406,7 @@ export default function App() {
         <div className="mx-auto flex w-full max-w-[1400px] items-center justify-between px-4 py-3 md:px-6">
           <div>
             <div className={`text-sm font-semibold uppercase tracking-wide ${subtextClasses}`}>Support Assistant</div>
-            <h1 className="text-lg font-semibold">Yext Hitchhikers Help Center</h1>
+            <h1 className="text-lg font-semibold">Cedars-Sinai Find-a-Doc</h1>
           </div>
           <div className="flex items-center gap-3">
             <div className={`hidden text-sm md:block ${subtextClasses}`}>Ask a question or choose a suggested prompt.</div>
