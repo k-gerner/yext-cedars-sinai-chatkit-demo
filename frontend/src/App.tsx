@@ -394,18 +394,18 @@ export default function App() {
       greeting: "Welcome to Cedars-Sinai Find-a-Doc! How can we help today?",
       prompts: [
         {
-          icon: "chart",
-          label: "Stomach pain",
+          icon: "search",
+          label: "Stomach Pain",
           prompt: "I'm having stomach pains, help me find doctors who can help.",
         },
         {
-          icon: "circle-question",
-          label: "Cancer",
+          icon: "search",
+          label: "Cancer Treatment",
           prompt: "Help me find a cancer specialist.",
         },
         {
-          icon: "circle-question",
-          label: "Knee pain",
+          icon: "search",
+          label: "Knee Pain",
           prompt: "I have some pain in my knee. Help me find doctors who can help.",
         },
       ],
