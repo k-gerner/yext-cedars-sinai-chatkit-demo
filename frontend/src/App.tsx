@@ -8,9 +8,61 @@ const CHATKIT_API_DOMAIN_KEY = import.meta.env.VITE_CHATKIT_API_DOMAIN_KEY ?? "d
 type ReferenceSource = {
   key: string;
   title: string;
+  filename?: string;
   subtitle?: string;
   kind: "url" | "file" | "entity" | "unknown";
 };
+
+type RawReferenceSource = {
+  type?: string;
+  title?: string;
+  filename?: string;
+  description?: string;
+  url?: string;
+  label?: string;
+  id?: string;
+};
+
+type AssistantContentPart = {
+  annotations?: Array<{
+    source?: RawReferenceSource | null;
+  }>;
+};
+
+type AssistantThreadItem = {
+  type?: string;
+  content?: AssistantContentPart[];
+};
+
+function toReferenceKind(type?: string): ReferenceSource["kind"] {
+  if (type === "url" || type === "file" || type === "entity") {
+    return type;
+  }
+
+  return "unknown";
+}
+
+function toReferenceSource(source: RawReferenceSource): ReferenceSource {
+  const kind = toReferenceKind(source.type);
+  const title = source.title?.trim() || "Untitled reference";
+  const filename = kind === "file" ? source.filename?.trim() || undefined : undefined;
+  const subtitle =
+    kind === "url"
+      ? source.url
+      : kind === "file"
+        ? source.description ?? filename
+        : kind === "entity"
+          ? source.label ?? source.id
+          : source.description;
+
+  return {
+    key: `${kind}|${title}|${filename ?? subtitle ?? ""}`,
+    title,
+    filename,
+    subtitle,
+    kind,
+  };
+}
 
 function openReferencePage(filename: string) {
   const safeFilename = filename.trim() || "unknown";
@@ -63,7 +115,8 @@ function ReferencesWidgetPanel({
           {!isLoadingReferences && referenceSources.length > 0 && (
             <div className="flex flex-col gap-2">
               {referenceSources.map((source) => {
-                const filename = source.kind === "file" && source.subtitle ? source.subtitle : source.title;
+                const filename =
+                  source.kind === "file" ? source.filename ?? source.subtitle ?? source.title : source.title;
                 const cardClasses = [
                   "flex items-center justify-between gap-3 rounded-xl px-3 py-2",
                   "transition-colors",
@@ -94,7 +147,7 @@ function ReferencesWidgetPanel({
                         <div className={`text-md font-semibold ${colorScheme === "dark" ? "text-gray-100" : "text-gray-900"}`}>
                           {source.title}
                         </div>
-                        <div className={`text-sm ${colorScheme === "dark" ? "text-gray-400" : "text-gray-500"}`}>
+                        <div className={`whitespace-pre-line text-sm ${colorScheme === "dark" ? "text-gray-400" : "text-gray-500"}`}>
                           {source.subtitle ?? source.kind.toUpperCase()}
                         </div>
                       </div>
@@ -274,10 +327,12 @@ export default function App() {
       const payload = await response.json();
       const items = Array.isArray(payload?.data) ? payload.data : [];
       const latestAssistant = items.find(
-        (item: any) =>
+        (item: AssistantThreadItem) =>
           item?.type === "assistant_message" &&
           Array.isArray(item?.content) &&
-          item.content.some((part: any) => Array.isArray(part?.annotations) && part.annotations.length > 0)
+          item.content.some(
+            (part: AssistantContentPart) => Array.isArray(part?.annotations) && part.annotations.length > 0
+          )
       );
 
       if (!latestAssistant) {
@@ -286,26 +341,18 @@ export default function App() {
       }
 
       const rawSources = (latestAssistant.content ?? [])
-        .flatMap((part: any) => part?.annotations ?? [])
-        .map((annotation: any) => annotation?.source)
-        .filter(Boolean);
+        .flatMap((part: AssistantContentPart) => part?.annotations ?? [])
+        .map((annotation: { source?: RawReferenceSource | null }) => annotation?.source)
+        .filter(
+          (source: RawReferenceSource | null | undefined): source is RawReferenceSource => Boolean(source)
+        );
 
       const unique = new Map<string, ReferenceSource>();
       for (const source of rawSources) {
-        const kind = source?.type ?? "unknown";
-        const title = source?.title ?? "Untitled reference";
-        const subtitle =
-          kind === "url"
-            ? source?.url
-            : kind === "file"
-              ? source?.filename ?? source?.description
-              : kind === "entity"
-                ? source?.label ?? source?.id
-                : source?.description;
-        const key = `${kind}|${title}|${subtitle ?? ""}`;
+        const normalizedSource = toReferenceSource(source);
 
-        if (!unique.has(key)) {
-          unique.set(key, { key, title, subtitle, kind });
+        if (!unique.has(normalizedSource.key)) {
+          unique.set(normalizedSource.key, normalizedSource);
         }
       }
 

@@ -27,19 +27,27 @@ from agents import (
     set_default_openai_client,
 )
 from openai import AsyncOpenAI
+from openai.types.responses.response_output_text import (
+    AnnotationContainerFileCitation,
+    AnnotationFileCitation,
+)
 from pydantic import BaseModel
-from chatkit.agents import AgentContext, simple_to_agent_input, stream_agent_response
+from chatkit.agents import (
+    AgentContext,
+    ResponseStreamConverter,
+    simple_to_agent_input,
+    stream_agent_response,
+)
 from chatkit.server import ChatKitServer, StreamingResult
 from chatkit.types import (
-  ThreadMetadata,
-  ThreadStreamEvent,
-  UserMessageItem,
-  ThreadMetadata,
-  UserMessageItem,
-  AssistantMessageItem,
-  AssistantMessageContent,
-  ThreadItemDoneEvent,
-  ThreadStreamEvent
+    Annotation,
+    AssistantMessageContent,
+    AssistantMessageItem,
+    FileSource,
+    ThreadItemDoneEvent,
+    ThreadMetadata,
+    ThreadStreamEvent,
+    UserMessageItem,
 )
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
@@ -94,6 +102,7 @@ rag_agent = Agent(
     instructions=(
         "You are a doctor-finder assistant. Your job is to help users find doctors who match their symptoms / health requirements. You have access to a Knowledge Base of valid doctors, and their specialties."
         "Make sure you have enough information before providing an answer. Ask follow up questions if necessary."
+        "If results have address data, make sure to include all of it in the response / citations."
         "Only use information from the Knowledge Base. "
         "If no answer is found, say 'I don't know' or similar. "
         "In your response, do not mention the file store directly, just the references themselves. "
@@ -121,12 +130,111 @@ logging.basicConfig(
 LOGGER = logging.getLogger(__name__)
 
 
+class VectorStoreCitationConverter(ResponseStreamConverter):
+    """Enrich file citations with vector-store attributes for frontend display."""
+
+    def __init__(self, client: AsyncOpenAI, vector_store_id: str):
+        super().__init__()
+        self.client = client
+        self.vector_store_id = vector_store_id
+        self._citation_metadata_cache: dict[str, tuple[str | None, str | None]] = {}
+
+    async def _get_citation_metadata(self, file_id: str) -> tuple[str | None, str | None]:
+        if file_id in self._citation_metadata_cache:
+            return self._citation_metadata_cache[file_id]
+
+        try:
+            vector_store_file = await self.client.vector_stores.files.retrieve(
+                file_id=file_id,
+                vector_store_id=self.vector_store_id,
+            )
+        except Exception:
+            LOGGER.exception(
+                "Failed to retrieve vector store metadata for citation file_id=%s",
+                file_id,
+            )
+            self._citation_metadata_cache[file_id] = (None, None)
+            return (None, None)
+
+        attributes = vector_store_file.attributes or {}
+        display_name: str | None = None
+        raw_name = attributes.get("name")
+        if isinstance(raw_name, str):
+            stripped_name = raw_name.strip()
+            if stripped_name:
+                display_name = stripped_name
+
+        address_line_1: str | None = None
+        raw_address_line_1 = attributes.get("addressLine1")
+        if isinstance(raw_address_line_1, str):
+            stripped_address_line_1 = raw_address_line_1.strip()
+            if stripped_address_line_1:
+                address_line_1 = stripped_address_line_1
+
+        locality_parts: list[str] = []
+        for key in ("city", "regionCode"):
+            raw_value = attributes.get(key)
+            if isinstance(raw_value, str):
+                stripped_value = raw_value.strip()
+                if stripped_value:
+                    locality_parts.append(stripped_value)
+
+        locality = ", ".join(locality_parts) if locality_parts else None
+        subtitle_lines = [line for line in (address_line_1, locality) if line]
+        subtitle = "\n".join(subtitle_lines) if subtitle_lines else None
+        metadata = (display_name, subtitle)
+        self._citation_metadata_cache[file_id] = metadata
+        return metadata
+
+    async def _build_file_annotation(
+        self,
+        *,
+        file_id: str,
+        filename: str,
+        index: int,
+    ) -> Annotation | None:
+        if not filename:
+            return None
+
+        display_name, subtitle = await self._get_citation_metadata(file_id)
+        return Annotation(
+            source=FileSource(
+                filename=filename,
+                title=display_name or filename,
+                description=subtitle,
+            ),
+            index=index,
+        )
+
+    async def file_citation_to_annotation(
+        self, file_citation: AnnotationFileCitation
+    ) -> Annotation | None:
+        return await self._build_file_annotation(
+            file_id=file_citation.file_id,
+            filename=file_citation.filename,
+            index=file_citation.index,
+        )
+
+    async def container_file_citation_to_annotation(
+        self, container_file_citation: AnnotationContainerFileCitation
+    ) -> Annotation | None:
+        return await self._build_file_annotation(
+            file_id=container_file_citation.file_id,
+            filename=container_file_citation.filename,
+            index=container_file_citation.end_index,
+        )
+
+
 class DemoChatKitServer(ChatKitServer[Dict[str, Any]]):
     """ChatKit server implementation."""
 
     def __init__(self, data_store: SimpleStore):
         # Initialize with no attachment store for simplicity
         super().__init__(data_store, attachment_store=None)
+        self.citation_converter = VectorStoreCitationConverter(
+            openai_client,
+            VECTOR_STORE_ID,
+        )
 
 
     async def respond(
@@ -157,7 +265,11 @@ class DemoChatKitServer(ChatKitServer[Dict[str, Any]]):
 
             # IMPORTANT: this converts Responses/Agents streaming events -> ChatKit ThreadStreamEvents
             # and auto-attaches file/url citations as ChatKit annotations (Sources in UI).
-            async for ev in stream_agent_response(agent_ctx, result):
+            async for ev in stream_agent_response(
+                agent_ctx,
+                result,
+                converter=self.citation_converter,
+            ):
                 yield ev
         except InputGuardrailTripwireTriggered as exc:
             output_info = exc.guardrail_result.output.output_info
