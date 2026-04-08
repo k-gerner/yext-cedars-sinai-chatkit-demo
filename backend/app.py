@@ -23,8 +23,10 @@ from agents import (
     GuardrailFunctionOutput,
     input_guardrail,
     InputGuardrailTripwireTriggered,
-    Runner
+    Runner,
+    set_default_openai_client,
 )
+from openai import AsyncOpenAI
 from pydantic import BaseModel
 from chatkit.agents import AgentContext, simple_to_agent_input, stream_agent_response
 from chatkit.server import ChatKitServer, StreamingResult
@@ -49,8 +51,18 @@ from simple_store import SimpleStore
 # Load environment variables
 load_dotenv()
 
-VECTOR_STORE_ID = "vs_68c3406b54148191b1bccebbc53ee263" # Hitchhikers
-# VECTOR_STORE_ID = "vs_696fe274d4e48191a041e24ea386b0bb" # Samsung
+# TODO: USE WATSON PROJECT ID; USING CONV UI PROJ KEY TEMPORARILY FOR NOW
+OPENAI_PROJECT_ID = "proj_hchduxzFJuIYU0P7tOG9sL55" #os.getenv("OPENAI_PROJECT_ID")
+VECTOR_STORE_ID = os.getenv("OPENAI_VECTOR_STORE_ID")
+
+if not OPENAI_PROJECT_ID:
+    raise RuntimeError("Missing OPENAI_PROJECT_ID in backend environment")
+
+if not VECTOR_STORE_ID:
+    raise RuntimeError("Missing OPENAI_VECTOR_STORE_ID in backend environment")
+
+openai_client = AsyncOpenAI(project=OPENAI_PROJECT_ID)
+set_default_openai_client(openai_client)
 
 class RelevancyCheck(BaseModel):
     is_relevant: bool
@@ -59,13 +71,9 @@ class RelevancyCheck(BaseModel):
 guardrail_agent= Agent(
     name="Query Relevance Guard",
     instructions=(
-        "Determine if the query is relevant to Yext services, technology product questions, general technology troubleshooting, or the capabilities of the agent. "
+        "Determine if the query is relevant to medical diagnosis, finding a doctor, or the capabilities of the agent. "
         "Return is_relevant=False if the query is not related to these topics."
-    ),
-    # instructions=(
-    #     "Determine if the query is relevant to customer support, technology product questions, general technology troubleshooting, or the capabilities of the agent. "
-    #     "Return is_relevant=False if the query is not related to these topics."
-    # ),
+    ),\
     output_type=RelevancyCheck
 )
 
@@ -84,6 +92,8 @@ async def relevancy_guard(ctx, agent, input_data):
 rag_agent = Agent(
     name="RAG assistant",
     instructions=(
+        "You are a doctor-finder assistant. Your job is to help users find doctors who match their symptoms / health requirements. You have access to a Knowledge Base of valid doctors, and their specialties."
+        "Make sure you have enough information before providing an answer. Ask follow up questions if necessary."
         "Only use information from the Knowledge Base. "
         "If no answer is found, say 'I don't know' or similar. "
         "In your response, do not mention the file store directly, just the references themselves. "
@@ -308,6 +318,8 @@ if __name__ == "__main__":
     print(f"📍 Server: http://localhost:{port}")
     print(f"📡 ChatKit endpoint: http://localhost:{port}/chatkit")
     print(f"🔑 API Key configured: {bool(os.getenv('OPENAI_API_KEY'))}")
+    print(f"🗂️ OpenAI project: {OPENAI_PROJECT_ID}")
+    print(f"📚 Vector store: {VECTOR_STORE_ID}")
     print("=" * 60)
     
     uvicorn.run(app, host="0.0.0.0", port=port)

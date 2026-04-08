@@ -43,6 +43,8 @@ chat-kit-testing/
 5. `cp .env.example .env` and set:
    ```
    OPENAI_API_KEY=sk-your-key
+   OPENAI_PROJECT_ID=proj_your_project
+   OPENAI_VECTOR_STORE_ID=vs_your_vector_store
    PORT=8000
    ```
 6. Run the server:
@@ -66,8 +68,8 @@ The app runs at `http://localhost:3000`.
 
 ## Notes / Configuration
 
-- The vector store ID is hardcoded in `backend/app.py`. Update `VECTOR_STORE_ID`
-  to point at your own store.
+- The backend reads `OPENAI_PROJECT_ID` and `OPENAI_VECTOR_STORE_ID` from `backend/.env`.
+- The API key and vector store must both be accessible from the same OpenAI project.
 - The ChatKit session endpoints are currently commented out in `backend/app.py`.
 
 ## Tech Stack
