@@ -31,7 +31,7 @@ from openai.types.responses.response_output_text import (
     AnnotationContainerFileCitation,
     AnnotationFileCitation,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from chatkit.agents import (
     AgentContext,
     ResponseStreamConverter,
@@ -60,8 +60,8 @@ from simple_store import SimpleStore
 load_dotenv()
 
 # TODO: USE WATSON PROJECT ID; USING CONV UI PROJ KEY TEMPORARILY FOR NOW
-OPENAI_PROJECT_ID = "proj_hchduxzFJuIYU0P7tOG9sL55" #os.getenv("OPENAI_PROJECT_ID")
-VECTOR_STORE_ID = os.getenv("OPENAI_VECTOR_STORE_ID")
+OPENAI_PROJECT_ID = os.getenv("OPENAI_PROJECT_ID") # old: "proj_hchduxzFJuIYU0P7tOG9sL55"
+VECTOR_STORE_ID = os.getenv("OPENAI_VECTOR_STORE_ID") # old: vs_69d679dd6ca8819181d3da3e147f2414
 
 if not OPENAI_PROJECT_ID:
     raise RuntimeError("Missing OPENAI_PROJECT_ID in backend environment")
@@ -72,18 +72,86 @@ if not VECTOR_STORE_ID:
 openai_client = AsyncOpenAI(project=OPENAI_PROJECT_ID)
 set_default_openai_client(openai_client)
 
+
+RELEVANCY_GUARD_INSTRUCTIONS = (
+    "Determine if the query is relevant to medical diagnosis, finding a doctor, "
+    "or the capabilities of the agent. Return is_relevant=False if the query is "
+    "not related to these topics."
+)
+
+CLARIFICATION_AGENT_INSTRUCTIONS = (
+    "You review the full conversation and decide whether the user has given enough "
+    "detail to search for doctors. "
+    "Only request clarification when the user is asking about symptoms, pain, or a "
+    "medical issue and the description is too vague to choose an appropriate doctor "
+    "or specialty. "
+    "When a symptom description is vague, require the most important missing detail "
+    "before doctor lookup. "
+    "Minimum detail rules for symptom complaints: "
+    "1) require the exact body area or sub-region before lookup; "
+    "2) for limb or joint pain, require laterality when relevant; "
+    "3) require at least one additional discriminator such as duration, onset, "
+    "severity, impact, or injury/context. "
+    "Ask only one highest-value follow-up question at a time. "
+    "Do not ask for details that are already present anywhere in the conversation. "
+    "If the user already named a specific specialty or gave enough detail to search, "
+    "set needs_clarification to false. "
+    "For clarification turns, you may include a short, broad, tentative specialty "
+    "hint, but never a diagnosis and never a specific doctor recommendation. "
+    "For example, vague leg pain may tentatively point toward orthopedics or sports "
+    "medicine while still requiring the exact location. "
+    "If no clarification is needed, return an empty follow_up_question and no hint."
+    "Summarize (for the user) the details you have already discerned and put that in the details_summary field. Do not mention details you are missing. Summarize in a conversational manner."
+)
+
+RAG_AGENT_INSTRUCTIONS = (
+    "You are a doctor-finder assistant. Your job is to help users find doctors who "
+    "match their symptoms or health requirements. You have access to a Knowledge "
+    "Base of valid doctors and their specialties. "
+    "Only use information from the Knowledge Base. "
+    "If no answer is found, say 'I don't know' or similar. "
+    "If results have address data, make sure to include all of it in the response "
+    "and citations. "
+    "Do not mention the file store directly, just the references themselves. "
+    "Make sure to cite sources when you use them. "
+    "If the input is blank or just regular conversation, you can greet or respond "
+    "to the user in a friendly manner. "
+    "Use list formatting when appropriate."
+)
+
+OUT_OF_SCOPE_MESSAGE = "Sorry, this falls outside of the scope I am able to assist with."
+DEFAULT_CLARIFICATION_QUESTION = (
+    "Can you tell me exactly where the pain or symptom is located and how long "
+    "it has been going on?"
+)
+
+
 class RelevancyCheck(BaseModel):
     is_relevant: bool
     reasoning: str
 
-guardrail_agent= Agent(
+
+class ClarificationCheck(BaseModel):
+    needs_clarification: bool
+    follow_up_question: str = ""
+    missing_details: list[str] = Field(default_factory=list)
+    tentative_specialty_hint: str | None = None
+    details_summary: str
+
+
+guardrail_agent = Agent(
     name="Query Relevance Guard",
-    instructions=(
-        "Determine if the query is relevant to medical diagnosis, finding a doctor, or the capabilities of the agent. "
-        "Return is_relevant=False if the query is not related to these topics."
-    ),\
-    output_type=RelevancyCheck
+    instructions=RELEVANCY_GUARD_INSTRUCTIONS,
+    output_type=RelevancyCheck,
 )
+
+
+clarification_agent = Agent(
+    name="Symptom Clarification Gate",
+    instructions=CLARIFICATION_AGENT_INSTRUCTIONS,
+    output_type=ClarificationCheck,
+)
+
 
 @input_guardrail(run_in_parallel=False) # ensures that it finishes before streaming starts
 async def relevancy_guard(ctx, agent, input_data):
@@ -99,17 +167,7 @@ async def relevancy_guard(ctx, agent, input_data):
 
 rag_agent = Agent(
     name="RAG assistant",
-    instructions=(
-        "You are a doctor-finder assistant. Your job is to help users find doctors who match their symptoms / health requirements. You have access to a Knowledge Base of valid doctors, and their specialties."
-        "Make sure you have enough information before providing an answer. Ask follow up questions if necessary."
-        "If results have address data, make sure to include all of it in the response / citations."
-        "Only use information from the Knowledge Base. "
-        "If no answer is found, say 'I don't know' or similar. "
-        "In your response, do not mention the file store directly, just the references themselves. "
-        "Make sure to cite sources when you use them. "
-        "If the input is blank or just regular conversation, you can just greet/respond to the user in a friendly manner. "
-        "Use list formatting when appropriate."
-    ),
+    instructions=RAG_AGENT_INSTRUCTIONS,
     tools=[
         FileSearchTool(
             vector_store_ids=[VECTOR_STORE_ID],
@@ -128,6 +186,37 @@ logging.basicConfig(
     force=True,
 )
 LOGGER = logging.getLogger(__name__)
+
+
+def build_assistant_message_event(
+    store: SimpleStore,
+    thread: ThreadMetadata,
+    context: dict[str, Any],
+    message_text: str,
+) -> ThreadItemDoneEvent:
+    message = AssistantMessageItem(
+        id=store.generate_item_id("message", thread, context),
+        thread_id=thread.id,
+        created_at=datetime.now(),
+        content=[
+            AssistantMessageContent(
+                text=message_text,
+                annotations=[],
+            )
+        ],
+    )
+    return ThreadItemDoneEvent(item=message)
+
+
+def format_clarification_message(clarification: ClarificationCheck) -> str:
+    follow_up_question = clarification.follow_up_question.strip() or DEFAULT_CLARIFICATION_QUESTION
+    details_summary = clarification.details_summary
+    tentative_hint = (clarification.tentative_specialty_hint or "").strip()
+    if tentative_hint:
+        LOGGER.info(f"Tentative guess: {tentative_hint}")
+    #     return f"{tentative_hint}\n\n{details_summary}\n\n{follow_up_question}"
+    # return follow_up_question
+    return f"{details_summary}\n\n{follow_up_question}"
 
 
 class VectorStoreCitationConverter(ResponseStreamConverter):
@@ -261,6 +350,26 @@ class DemoChatKitServer(ChatKitServer[Dict[str, Any]]):
         agent_input = await simple_to_agent_input(items_page.data)
 
         try:
+            clarification_result = await Runner.run(
+                clarification_agent,
+                agent_input,
+                context=agent_ctx,
+            )
+            clarification: ClarificationCheck = clarification_result.final_output
+            LOGGER.info(
+                "Clarification gate: needs_clarification=%s missing_details=%s",
+                clarification.needs_clarification,
+                clarification.missing_details,
+            )
+            if clarification.needs_clarification:
+                yield build_assistant_message_event(
+                    self.store,
+                    thread,
+                    context,
+                    format_clarification_message(clarification),
+                )
+                return
+
             result = Runner.run_streamed(rag_agent, agent_input, context=agent_ctx)
 
             # IMPORTANT: this converts Responses/Agents streaming events -> ChatKit ThreadStreamEvents
@@ -273,24 +382,13 @@ class DemoChatKitServer(ChatKitServer[Dict[str, Any]]):
                 yield ev
         except InputGuardrailTripwireTriggered as exc:
             output_info = exc.guardrail_result.output.output_info
-            # message_text = (
-            #     output_info
-            #     if isinstance(output_info, str) and output_info.strip()
-            #     else "Sorry, this falls outside of the scope I am able to assist with."
-            # )
-            message_text = "Sorry, this falls outside of the scope I am able to assist with."
-            message = AssistantMessageItem(
-                id=self.store.generate_item_id("message", thread, context),
-                thread_id=thread.id,
-                created_at=datetime.now(),
-                content=[
-                    AssistantMessageContent(
-                        text=message_text,
-                        annotations=[],
-                    )
-                ],
+            LOGGER.info("Input guardrail triggered: %s", output_info)
+            yield build_assistant_message_event(
+                self.store,
+                thread,
+                context,
+                OUT_OF_SCOPE_MESSAGE,
             )
-            yield ThreadItemDoneEvent(item=message)
 
 
 
