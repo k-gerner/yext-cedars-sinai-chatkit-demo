@@ -117,6 +117,7 @@ RAG_AGENT_INSTRUCTIONS = (
     "If the input is blank or just regular conversation, you can greet or respond "
     "to the user in a friendly manner. "
     "Use list formatting when appropriate."
+    "Don't include languages or gender in the response, unless it is relevant to the user's search."
 )
 
 OUT_OF_SCOPE_MESSAGE = "Sorry, this falls outside of the scope I am able to assist with."
