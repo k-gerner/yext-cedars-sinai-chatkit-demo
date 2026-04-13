@@ -395,8 +395,8 @@ export default function App() {
       prompts: [
         {
           icon: "search",
-          label: "Stomach Pain",
-          prompt: "I'm having stomach pains, help me find doctors who can help.",
+          label: "Primary Care Provider",
+          prompt: "Help me find a primary care provider.",
         },
         {
           icon: "search",
