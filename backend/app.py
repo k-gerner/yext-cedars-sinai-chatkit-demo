@@ -23,6 +23,7 @@ from agents import (
     GuardrailFunctionOutput,
     input_guardrail,
     InputGuardrailTripwireTriggered,
+    ModelSettings,
     Runner,
     set_default_openai_client,
 )
@@ -31,6 +32,7 @@ from openai.types.responses.response_output_text import (
     AnnotationContainerFileCitation,
     AnnotationFileCitation,
 )
+from openai.types.shared import Reasoning
 from pydantic import BaseModel, Field
 from chatkit.agents import (
     AgentContext,
@@ -157,6 +159,7 @@ clarification_agent = Agent(
 @input_guardrail(run_in_parallel=False) # ensures that it finishes before streaming starts
 async def relevancy_guard(ctx, agent, input_data):
     result = await Runner.run(guardrail_agent, input_data, context=ctx)
+    _log_token_usage("relevancy_guard", result)
     analysis: RelevancyCheck = result.final_output
     print(f"Relevancy check: is_relevant={analysis.is_relevant}, reasoning={analysis.reasoning}")
 
@@ -172,10 +175,18 @@ rag_agent = Agent(
     tools=[
         FileSearchTool(
             vector_store_ids=[VECTOR_STORE_ID],
-            max_num_results=8,
+            max_num_results=10,
+            include_search_results=True,
         )
     ],
-    input_guardrails=[relevancy_guard]
+    input_guardrails=[relevancy_guard],
+    model="gpt-5-nano",
+    model_settings=ModelSettings(
+        reasoning=Reasoning(
+            effort="low"
+        ),
+        parallel_tool_calls=True
+    )
 )
 
 LOG_FORMAT = "%(asctime)s %(message)s"
@@ -228,6 +239,51 @@ class VectorStoreCitationConverter(ResponseStreamConverter):
         self.client = client
         self.vector_store_id = vector_store_id
         self._citation_metadata_cache: dict[str, tuple[str | None, str | None]] = {}
+
+    def _metadata_from_attributes(
+        self, attributes: dict[str, Any] | None
+    ) -> tuple[str | None, str | None, str | None]:
+        attributes = attributes or {}
+
+        display_name: str | None = None
+        raw_name = attributes.get("name")
+        if isinstance(raw_name, str):
+            stripped_name = raw_name.strip()
+            if stripped_name:
+                display_name = stripped_name
+
+        address_line_1: str | None = None
+        raw_address_line_1 = attributes.get("addressLine1")
+        if isinstance(raw_address_line_1, str):
+            stripped_address_line_1 = raw_address_line_1.strip()
+            if stripped_address_line_1:
+                address_line_1 = stripped_address_line_1
+
+        locality_parts: list[str] = []
+        for key in ("city", "regionCode"):
+            raw_value = attributes.get(key)
+            if isinstance(raw_value, str):
+                stripped_value = raw_value.strip()
+                if stripped_value:
+                    locality_parts.append(stripped_value)
+
+        locality = ", ".join(locality_parts) if locality_parts else None
+        subtitle_lines = [line for line in (address_line_1, locality) if line]
+        subtitle = "\n".join(subtitle_lines) if subtitle_lines else None
+
+        return display_name, subtitle
+
+    def cache_file_search_results(self, results: list[Any] | None) -> None:
+        if not results:
+            return
+
+        for result in results:
+            file_id = getattr(result, "file_id", None)
+            if not isinstance(file_id, str) or not file_id:
+                continue
+            self._citation_metadata_cache[file_id] = self._metadata_from_attributes(
+                getattr(result, "attributes", None)
+            )
 
     async def _get_citation_metadata(self, file_id: str) -> tuple[str | None, str | None]:
         if file_id in self._citation_metadata_cache:
@@ -315,6 +371,36 @@ class VectorStoreCitationConverter(ResponseStreamConverter):
         )
 
 
+class MetadataCachingRunResult:
+    """Intercept file search tool results so citation metadata can be cached."""
+
+    def __init__(
+        self,
+        result: Any,
+        converter: VectorStoreCitationConverter,
+    ):
+        self._result = result
+        self._converter = converter
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._result, name)
+
+    async def stream_events(self) -> AsyncIterator[Any]:
+        async for event in self._result.stream_events():
+            if event.type == "raw_response_event":
+                raw_event = event.data
+                if raw_event.type == "response.output_item.done":
+                    item = raw_event.item
+                    if getattr(item, "type", None) == "file_search_call":
+                        self._converter.cache_file_search_results(
+                            getattr(item, "results", None)
+                        )
+            yield event
+
+
+
+
+
 class DemoChatKitServer(ChatKitServer[Dict[str, Any]]):
     """ChatKit server implementation."""
 
@@ -356,6 +442,7 @@ class DemoChatKitServer(ChatKitServer[Dict[str, Any]]):
                 agent_input,
                 context=agent_ctx,
             )
+            _log_token_usage("clarification_agent", clarification_result)
             clarification: ClarificationCheck = clarification_result.final_output
             LOGGER.info(
                 "Clarification gate: needs_clarification=%s missing_details=%s",
@@ -373,14 +460,20 @@ class DemoChatKitServer(ChatKitServer[Dict[str, Any]]):
 
             result = Runner.run_streamed(rag_agent, agent_input, context=agent_ctx)
 
+            metadata_caching_result = MetadataCachingRunResult(
+                result,
+                self.citation_converter,
+            )
+
             # IMPORTANT: this converts Responses/Agents streaming events -> ChatKit ThreadStreamEvents
             # and auto-attaches file/url citations as ChatKit annotations (Sources in UI).
             async for ev in stream_agent_response(
                 agent_ctx,
-                result,
+                metadata_caching_result,
                 converter=self.citation_converter,
             ):
                 yield ev
+            _log_token_usage("rag_agent", result)
         except InputGuardrailTripwireTriggered as exc:
             output_info = exc.guardrail_result.output.output_info
             LOGGER.info("Input guardrail triggered: %s", output_info)
@@ -414,7 +507,10 @@ chatkit_server = DemoChatKitServer(data_store)
 @app.post("/chatkit")
 async def chatkit_endpoint(request: Request):
     body = await request.body()
-    context = {}
+    request_id = str(uuid.uuid4())
+    context = {"request_id": request_id}
+
+    LOGGER.info("Processing /chatkit request_id=%s", request_id)
 
     print("threads: ", chatkit_server.store.threads)
     result = await chatkit_server.process(body, context)
@@ -512,6 +608,69 @@ async def chatkit_endpoint(request: Request):
 #         content={"clientSecret": client_secret},
 #         headers=cors_headers,
 #     )
+
+
+def _extract_request_id(context: Any) -> str | None:
+    current = context
+    for _ in range(4):
+        if current is None:
+            return None
+        if isinstance(current, dict):
+            request_id = current.get("request_id")
+            return request_id if isinstance(request_id, str) else None
+
+        request_context = getattr(current, "request_context", None)
+        if isinstance(request_context, dict):
+            request_id = request_context.get("request_id")
+            if isinstance(request_id, str):
+                return request_id
+
+        nested_context = getattr(current, "context", None)
+        if nested_context is not None and nested_context is not current:
+            current = nested_context
+            continue
+        if request_context is not None and request_context is not current:
+            current = request_context
+            continue
+        break
+
+    return None
+
+
+def _log_token_usage(label: str, result: Any) -> None:
+    context_wrapper = getattr(result, "context_wrapper", None)
+    usage = getattr(context_wrapper, "usage", None)
+    request_id = _extract_request_id(getattr(context_wrapper, "context", None))
+    request_id_part = f" request_id={request_id}" if request_id else ""
+
+    if usage is None:
+        LOGGER.info("---- Token usage [%s]%s unavailable", label, request_id_part)
+        return
+
+    request_entries = list(getattr(usage, "request_usage_entries", []))
+    if request_entries:
+        for index, request_usage in enumerate(request_entries, start=1):
+            LOGGER.info(
+                "---- Token usage [%s call=%s/%s]%s input=%s output=%s total=%s",
+                label,
+                index,
+                len(request_entries),
+                request_id_part,
+                request_usage.input_tokens,
+                request_usage.output_tokens,
+                request_usage.total_tokens,
+            )
+
+    LOGGER.info(
+        "---- Token usage [%s total]%s input=%s output=%s total=%s requests=%s",
+        label,
+        request_id_part,
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.total_tokens,
+        usage.requests,
+    )
+
 
 
 @app.get("/health")
