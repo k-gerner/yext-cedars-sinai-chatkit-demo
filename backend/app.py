@@ -115,7 +115,7 @@ RAG_AGENT_INSTRUCTIONS = (
     "If results have address data, make sure to include all of it in the response "
     "and citations. "
     "Do not mention the file store directly, just the references themselves. "
-    "Make sure to cite sources when you use them. "
+    # "Make sure to cite sources when you use them. "
     "If the input is blank or just regular conversation, you can greet or respond "
     "to the user in a friendly manner. "
     "Use list formatting when appropriate."
