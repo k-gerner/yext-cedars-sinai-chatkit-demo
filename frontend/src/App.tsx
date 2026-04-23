@@ -1,9 +1,11 @@
 import { ChatKit, useChatKit } from "@openai/chatkit-react";
-import { CgClose, CgFileDocument, CgOptions } from "react-icons/cg";
+import { CgClose, CgOptions } from "react-icons/cg";
 import { useCallback, useEffect, useState } from "react";
 
 const CHATKIT_API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000/chatkit";
 const CHATKIT_API_DOMAIN_KEY = import.meta.env.VITE_CHATKIT_API_DOMAIN_KEY ?? "domain_pk_localhost_dev";
+const REFERENCE_CARD_AVATAR_URL =
+  "https://www.cedars-sinai.org/etc.clientlibs/cedars-sinai/clientlibs/clientlib-react/resources/static/media/provider-avatar.0ff2508b7f1cbabed667.png";
 
 type ReferenceSource = {
   key: string;
@@ -118,48 +120,61 @@ function ReferencesWidgetPanel({
                 const filename =
                   source.kind === "file" ? source.filename ?? source.subtitle ?? source.title : source.title;
                 const cardClasses = [
-                  "flex items-center justify-between gap-3 rounded-xl px-3 py-2",
-                  "transition-colors",
+                  "overflow-hidden rounded-2xl border p-4 shadow-sm transition-all",
                   colorScheme === "dark"
-                    ? "bg-slate-700/60 hover:bg-slate-900/80 border border-slate-800"
-                    : "bg-slate-50 hover:bg-white border border-slate-200",
+                    ? "border-slate-700 bg-slate-800/80 hover:border-slate-600 hover:bg-slate-800"
+                    : "border-slate-200 bg-white hover:-translate-y-0.5 hover:shadow-md",
                 ].join(" ");
                 const visitClasses = [
-                  "shrink-0 rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-wide cursor-pointer",
+                  "w-full rounded-full px-4 py-3 text-sm font-semibold uppercase tracking-wide cursor-pointer",
                   "text-white transition-opacity hover:opacity-90",
                 ].join(" ");
+                const subtitle = source.subtitle ?? source.kind.toUpperCase();
 
                 return (
                   <div key={source.key} className={cardClasses}>
-                    <div className="flex min-w-0 items-start gap-2">
-                      <div
-                        className={[
-                          "mt-0.5 flex h-7 w-7 items-center justify-center rounded-md border",
-                          colorScheme === "dark"
-                            ? "border-slate-700 bg-slate-800 text-slate-200"
-                            : "border-slate-200 bg-white text-slate-600",
-                        ].join(" ")}
-                        aria-hidden="true"
-                      >
-                        <CgFileDocument className="h-4 w-4" />
+                    <div className="flex items-start gap-4">
+                      <div className="shrink-0">
+                        <img
+                          src={REFERENCE_CARD_AVATAR_URL}
+                          alt={`${source.title} avatar`}
+                          className={[
+                            "h-16 w-16 rounded-full object-cover",
+                            colorScheme === "dark" ? "border-2 border-slate-600" : "border-2 border-slate-200",
+                          ].join(" ")}
+                        />
                       </div>
-                      <div className="min-w-0">
-                        <div className={`text-md font-semibold ${colorScheme === "dark" ? "text-gray-100" : "text-gray-900"}`}>
+                      <div className="min-w-0 flex-1">
+                        <div
+                          className={[
+                            "mb-1 inline-flex rounded-full px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.18em]",
+                            colorScheme === "dark"
+                              ? "bg-slate-700 text-slate-300"
+                              : "bg-slate-100 text-slate-500",
+                          ].join(" ")}
+                        >
+                          Source
+                        </div>
+                        <div className={`text-base font-semibold ${colorScheme === "dark" ? "text-gray-100" : "text-gray-900"}`}>
                           {source.title}
                         </div>
-                        <div className={`whitespace-pre-line text-sm ${colorScheme === "dark" ? "text-gray-400" : "text-gray-500"}`}>
-                          {source.subtitle ?? source.kind.toUpperCase()}
+                        <div
+                          className={`mt-1 whitespace-pre-line text-sm leading-6 ${colorScheme === "dark" ? "text-gray-400" : "text-gray-500"}`}
+                        >
+                          {subtitle}
                         </div>
                       </div>
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => openReferencePage(filename)}
-                      className={visitClasses}
-                      style={{ backgroundColor: accentColor }}
-                    >
-                      Visit
-                    </button>
+                    <div className="mt-4">
+                      <button
+                        type="button"
+                        onClick={() => openReferencePage(filename)}
+                        className={visitClasses}
+                        style={{ backgroundColor: accentColor }}
+                      >
+                        Schedule an Appointment
+                      </button>
+                    </div>
                   </div>
                 );
               })}
