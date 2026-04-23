@@ -14,7 +14,16 @@ import sys
 import uuid
 import httpx
 import logging
+import warnings
 from typing import Any, Dict
+
+# ChatKit still emits this deprecation from its internal widget validation path
+# even when using WidgetTemplate-backed widgets.
+warnings.filterwarnings(
+    "ignore",
+    message="Direct usage of named widget classes is deprecated.*",
+    category=DeprecationWarning,
+)
 
 import uvicorn
 from agents import (
@@ -50,7 +59,9 @@ from chatkit.types import (
     ThreadMetadata,
     ThreadStreamEvent,
     UserMessageItem,
+    WidgetItem,
 )
+from chatkit.widgets import WidgetTemplate
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -70,6 +81,12 @@ if not OPENAI_PROJECT_ID:
 
 if not VECTOR_STORE_ID:
     raise RuntimeError("Missing OPENAI_VECTOR_STORE_ID in backend environment")
+
+REFERENCE_CARD_AVATAR_URL = (
+    "https://www.cedars-sinai.org/etc.clientlibs/cedars-sinai/clientlibs/"
+    "clientlib-react/resources/static/media/provider-avatar.0ff2508b7f1cbabed667.png"
+)
+SOURCES_WIDGET_TEMPLATE = WidgetTemplate.from_file("sources.widget")
 
 openai_client = AsyncOpenAI(project=OPENAI_PROJECT_ID)
 set_default_openai_client(openai_client)
@@ -140,6 +157,14 @@ class ClarificationCheck(BaseModel):
     missing_details: list[str] = Field(default_factory=list)
     tentative_specialty_hint: str | None = None
     details_summary: str
+
+
+class ReferenceSource(BaseModel):
+    key: str
+    title: str
+    destination: str
+    filename: str | None = None
+    subtitle: str | None = None
 
 
 guardrail_agent = Agent(
@@ -220,6 +245,52 @@ def build_assistant_message_event(
     return ThreadItemDoneEvent(item=message)
 
 
+def build_reference_source(
+    *,
+    filename: str,
+    display_name: str | None,
+    subtitle: str | None,
+) -> ReferenceSource:
+    normalized_filename = filename.strip()
+    normalized_title = (display_name or "").strip() or normalized_filename or "Untitled reference"
+    normalized_subtitle = subtitle.strip() if isinstance(subtitle, str) and subtitle.strip() else None
+    destination = normalized_filename or normalized_title
+    key = f"file|{normalized_title}|{normalized_filename or normalized_subtitle or ''}"
+
+    return ReferenceSource(
+        key=key,
+        title=normalized_title,
+        destination=destination,
+        filename=normalized_filename or None,
+        subtitle=normalized_subtitle,
+    )
+
+
+def build_sources_widget_event(
+    store: SimpleStore,
+    thread: ThreadMetadata,
+    context: dict[str, Any],
+    reference_sources: list[ReferenceSource],
+) -> ThreadItemDoneEvent:
+    copy_text = "\n".join(
+        f"{source.title}: {source.subtitle}" if source.subtitle else source.title
+        for source in reference_sources
+    )
+    widget_item = WidgetItem(
+        id=store.generate_item_id("message", thread, context),
+        thread_id=thread.id,
+        created_at=datetime.now(),
+        widget=SOURCES_WIDGET_TEMPLATE.build(
+            {
+                "avatar_url": REFERENCE_CARD_AVATAR_URL,
+                "reference_sources": reference_sources,
+            }
+        ),
+        copy_text=copy_text or None,
+    )
+    return ThreadItemDoneEvent(item=widget_item)
+
+
 def format_clarification_message(clarification: ClarificationCheck) -> str:
     follow_up_question = clarification.follow_up_question.strip() or DEFAULT_CLARIFICATION_QUESTION
     details_summary = clarification.details_summary
@@ -234,15 +305,21 @@ def format_clarification_message(clarification: ClarificationCheck) -> str:
 class VectorStoreCitationConverter(ResponseStreamConverter):
     """Enrich file citations with vector-store attributes for frontend display."""
 
-    def __init__(self, client: AsyncOpenAI, vector_store_id: str):
+    def __init__(
+        self,
+        client: AsyncOpenAI,
+        vector_store_id: str,
+        metadata_cache: dict[str, tuple[str | None, str | None]] | None = None,
+    ):
         super().__init__()
         self.client = client
         self.vector_store_id = vector_store_id
-        self._citation_metadata_cache: dict[str, tuple[str | None, str | None]] = {}
+        self._citation_metadata_cache = metadata_cache if metadata_cache is not None else {}
+        self._reference_sources: dict[str, ReferenceSource] = {}
 
     def _metadata_from_attributes(
         self, attributes: dict[str, Any] | None
-    ) -> tuple[str | None, str | None, str | None]:
+    ) -> tuple[str | None, str | None]:
         attributes = attributes or {}
 
         display_name: str | None = None
@@ -273,6 +350,21 @@ class VectorStoreCitationConverter(ResponseStreamConverter):
 
         return display_name, subtitle
 
+    def _remember_reference_source(
+        self,
+        *,
+        filename: str,
+        display_name: str | None,
+        subtitle: str | None,
+    ) -> None:
+        reference_source = build_reference_source(
+            filename=filename,
+            display_name=display_name,
+            subtitle=subtitle,
+        )
+        if reference_source.key not in self._reference_sources:
+            self._reference_sources[reference_source.key] = reference_source
+
     def cache_file_search_results(self, results: list[Any] | None) -> None:
         if not results:
             return
@@ -302,35 +394,12 @@ class VectorStoreCitationConverter(ResponseStreamConverter):
             self._citation_metadata_cache[file_id] = (None, None)
             return (None, None)
 
-        attributes = vector_store_file.attributes or {}
-        display_name: str | None = None
-        raw_name = attributes.get("name")
-        if isinstance(raw_name, str):
-            stripped_name = raw_name.strip()
-            if stripped_name:
-                display_name = stripped_name
-
-        address_line_1: str | None = None
-        raw_address_line_1 = attributes.get("addressLine1")
-        if isinstance(raw_address_line_1, str):
-            stripped_address_line_1 = raw_address_line_1.strip()
-            if stripped_address_line_1:
-                address_line_1 = stripped_address_line_1
-
-        locality_parts: list[str] = []
-        for key in ("city", "regionCode"):
-            raw_value = attributes.get(key)
-            if isinstance(raw_value, str):
-                stripped_value = raw_value.strip()
-                if stripped_value:
-                    locality_parts.append(stripped_value)
-
-        locality = ", ".join(locality_parts) if locality_parts else None
-        subtitle_lines = [line for line in (address_line_1, locality) if line]
-        subtitle = "\n".join(subtitle_lines) if subtitle_lines else None
-        metadata = (display_name, subtitle)
+        metadata = self._metadata_from_attributes(vector_store_file.attributes or {})
         self._citation_metadata_cache[file_id] = metadata
         return metadata
+
+    def take_reference_sources(self) -> list[ReferenceSource]:
+        return list(self._reference_sources.values())
 
     async def _build_file_annotation(
         self,
@@ -343,6 +412,11 @@ class VectorStoreCitationConverter(ResponseStreamConverter):
             return None
 
         display_name, subtitle = await self._get_citation_metadata(file_id)
+        self._remember_reference_source(
+            filename=filename,
+            display_name=display_name,
+            subtitle=subtitle,
+        )
         return Annotation(
             source=FileSource(
                 filename=filename,
@@ -407,10 +481,7 @@ class DemoChatKitServer(ChatKitServer[Dict[str, Any]]):
     def __init__(self, data_store: SimpleStore):
         # Initialize with no attachment store for simplicity
         super().__init__(data_store, attachment_store=None)
-        self.citation_converter = VectorStoreCitationConverter(
-            openai_client,
-            VECTOR_STORE_ID,
-        )
+        self._citation_metadata_cache: dict[str, tuple[str | None, str | None]] = {}
 
 
     async def respond(
@@ -458,11 +529,16 @@ class DemoChatKitServer(ChatKitServer[Dict[str, Any]]):
                 )
                 return
 
+            citation_converter = VectorStoreCitationConverter(
+                openai_client,
+                VECTOR_STORE_ID,
+                metadata_cache=self._citation_metadata_cache,
+            )
             result = Runner.run_streamed(rag_agent, agent_input, context=agent_ctx)
 
             metadata_caching_result = MetadataCachingRunResult(
                 result,
-                self.citation_converter,
+                citation_converter,
             )
 
             # IMPORTANT: this converts Responses/Agents streaming events -> ChatKit ThreadStreamEvents
@@ -470,9 +546,17 @@ class DemoChatKitServer(ChatKitServer[Dict[str, Any]]):
             async for ev in stream_agent_response(
                 agent_ctx,
                 metadata_caching_result,
-                converter=self.citation_converter,
+                converter=citation_converter,
             ):
                 yield ev
+            reference_sources = citation_converter.take_reference_sources()
+            if reference_sources:
+                yield build_sources_widget_event(
+                    self.store,
+                    thread,
+                    context,
+                    reference_sources,
+                )
             _log_token_usage("rag_agent", result)
         except InputGuardrailTripwireTriggered as exc:
             output_info = exc.guardrail_result.output.output_info
